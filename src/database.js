@@ -4,32 +4,97 @@ const config = require('./config');
 // ============ SCHEMAS ============
 
 const videoSchema = new mongoose.Schema({
-  url: { type: String, required: true, unique: true, index: true },
-  title: { type: String, required: true },
-  fileId: { type: String, required: true },
-  sizeMb: { type: Number, required: true },
+  url: { 
+    type: String, 
+    required: true, 
+    unique: true, 
+    index: true 
+  },
+  title: { 
+    type: String, 
+    required: true 
+  },
+  fileId: { 
+    type: String, 
+    required: true 
+  },
+  sizeMb: { 
+    type: Number, 
+    required: true 
+  },
   thumbnail: String,
   duration: Number,
-  views: { type: Number, default: 0 },
-  channelPosted: { type: Boolean, default: true },
-  addedAt: { type: Date, default: Date.now, index: true }
+  views: { 
+    type: Number, 
+    default: 0 
+  },
+  channelPosted: { 
+    type: Boolean, 
+    default: true 
+  },
+  addedAt: { 
+    type: Date, 
+    default: Date.now, 
+    index: true 
+  }
 });
 
 const userSchema = new mongoose.Schema({
-  userId: { type: Number, required: true, unique: true, index: true },
+  userId: { 
+    type: Number, 
+    required: true, 
+    unique: true, 
+    index: true 
+  },
   username: String,
   firstName: String,
-  totalVideosWatched: { type: Number, default: 0 },
-  seenVideos: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Video' }],
-  joinedAt: { type: Date, default: Date.now },
-  lastActive: { type: Date, default: Date.now }
+  totalVideosWatched: { 
+    type: Number, 
+    default: 0 
+  },
+  seenVideos: [{ 
+    type: mongoose.Schema.Types.ObjectId, 
+    ref: 'Video' 
+  }],
+  joinedAt: { 
+    type: Date, 
+    default: Date.now 
+  },
+  lastActive: { 
+    type: Date, 
+    default: Date.now 
+  }
+});
+
+// Keep only last 100 seen videos
+userSchema.pre('save', function(next) {
+  if (this.seenVideos && this.seenVideos.length > 100) {
+    this.seenVideos = this.seenVideos.slice(-100);
+  }
+  next();
 });
 
 const scrapeQueueSchema = new mongoose.Schema({
-  url: { type: String, required: true, unique: true },
-  status: { type: String, enum: ['pending', 'processing', 'done', 'failed'], default: 'pending', index: true },
-  retries: { type: Number, default: 0 },
-  addedAt: { type: Date, default: Date.now, index: true },
+  url: { 
+    type: String, 
+    required: true, 
+    unique: true 
+  },
+  status: { 
+    type: String, 
+    enum: ['pending', 'processing', 'done', 'failed'], 
+    default: 'pending', 
+    index: true 
+  },
+  retries: { 
+    type: Number, 
+    default: 0 
+  },
+  addedAt: { 
+    type: Date, 
+    default: Date.now, 
+    index: true 
+  },
   error: String
 });
 
@@ -43,21 +108,26 @@ const ScrapeQueue = mongoose.model('ScrapeQueue', scrapeQueueSchema);
 
 const connectDB = async () => {
   try {
+    mongoose.set('strictQuery', false);
+    
     await mongoose.connect(config.MONGO_URI, {
       maxPoolSize: 10,
       minPoolSize: 2,
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
     });
-    console.log('✅ MongoDB connected');
+    
+    console.log('✅ MongoDB connected successfully');
     
     // Create indexes
     await Video.createIndexes();
     await User.createIndexes();
     await ScrapeQueue.createIndexes();
     
+    console.log('✅ Database indexes created');
+    
   } catch (error) {
-    console.error('❌ MongoDB connection error:', error);
+    console.error('❌ MongoDB connection error:', error.message);
     process.exit(1);
   }
 };
@@ -68,56 +138,74 @@ const addVideo = async (videoData) => {
   try {
     const video = new Video(videoData);
     await video.save();
-    console.log(`✅ New video added: ${videoData.title.substring(0, 50)}`);
+    console.log(`✅ New video: ${videoData.title.substring(0, 50)}`);
     return video;
   } catch (error) {
     if (error.code === 11000) {
-      console.log(`⚠️ Video already exists: ${videoData.url}`);
+      // Duplicate - already exists
       return null;
     }
-    console.error('❌ Add video error:', error);
+    console.error('❌ Add video error:', error.message);
     return null;
   }
 };
 
 const videoExists = async (url) => {
-  return await Video.exists({ url });
+  const count = await Video.countDocuments({ url });
+  return count > 0;
 };
 
 const getNextUnseenVideo = async (userId) => {
-  const user = await User.findOne({ userId }).select('seenVideos');
-  const seenIds = user?.seenVideos?.slice(-100) || [];
-  
-  let video = await Video.findOne({ _id: { $nin: seenIds } })
+  try {
+    const user = await User.findOne({ userId }).select('seenVideos').lean();
+    const seenIds = user?.seenVideos?.slice(-100) || [];
+    
+    let video = await Video.findOne({ 
+      _id: { $nin: seenIds } 
+    })
     .sort({ addedAt: -1 })
     .lean();
-  
-  // If all seen, reset
-  if (!video) {
-    await User.updateOne({ userId }, { $set: { seenVideos: [] } });
-    video = await Video.findOne().sort({ addedAt: -1 }).lean();
+    
+    // If all videos seen, reset
+    if (!video) {
+      await User.updateOne(
+        { userId }, 
+        { $set: { seenVideos: [] } }
+      );
+      video = await Video.findOne().sort({ addedAt: -1 }).lean();
+    }
+    
+    return video;
+  } catch (error) {
+    console.error('❌ Get video error:', error.message);
+    return null;
   }
-  
-  return video;
 };
 
 const markVideoSeen = async (userId, videoId) => {
-  await User.updateOne(
-    { userId },
-    {
-      $push: {
-        seenVideos: {
-          $each: [videoId],
-          $slice: -100 // Keep only last 100
-        }
+  try {
+    await User.updateOne(
+      { userId },
+      {
+        $push: {
+          seenVideos: {
+            $each: [videoId],
+            $slice: -100
+          }
+        },
+        $inc: { totalVideosWatched: 1 },
+        $set: { lastActive: new Date() }
       },
-      $inc: { totalVideosWatched: 1 },
-      $set: { lastActive: new Date() }
-    },
-    { upsert: true }
-  );
-  
-  await Video.updateOne({ _id: videoId }, { $inc: { views: 1 } });
+      { upsert: true }
+    );
+    
+    await Video.updateOne(
+      { _id: videoId }, 
+      { $inc: { views: 1 } }
+    );
+  } catch (error) {
+    console.error('❌ Mark seen error:', error.message);
+  }
 };
 
 const getTotalVideos = async () => {
@@ -127,22 +215,26 @@ const getTotalVideos = async () => {
 // ============ USER FUNCTIONS ============
 
 const addUser = async (userId, username, firstName) => {
-  await User.updateOne(
-    { userId },
-    {
-      $set: {
-        username,
-        firstName,
-        lastActive: new Date()
+  try {
+    await User.updateOne(
+      { userId },
+      {
+        $set: {
+          username,
+          firstName,
+          lastActive: new Date()
+        },
+        $setOnInsert: {
+          joinedAt: new Date(),
+          totalVideosWatched: 0,
+          seenVideos: []
+        }
       },
-      $setOnInsert: {
-        joinedAt: new Date(),
-        totalVideosWatched: 0,
-        seenVideos: []
-      }
-    },
-    { upsert: true }
-  );
+      { upsert: true }
+    );
+  } catch (error) {
+    console.error('❌ Add user error:', error.message);
+  }
 };
 
 const getUserStats = async (userId) => {
@@ -156,69 +248,115 @@ const getTotalUsers = async () => {
 // ============ SCRAPE QUEUE FUNCTIONS ============
 
 const addToScrapeQueue = async (urls) => {
-  const docs = urls.map(url => ({ url, status: 'pending' }));
+  if (!urls || urls.length === 0) return;
+  
+  const docs = urls.map(url => ({ 
+    url, 
+    status: 'pending',
+    addedAt: new Date()
+  }));
   
   try {
     await ScrapeQueue.insertMany(docs, { ordered: false });
   } catch (error) {
-    // Ignore duplicate errors
+    // Ignore duplicate key errors
     if (error.code !== 11000) {
-      console.error('Queue insert error:', error);
+      console.error('❌ Queue insert error:', error.message);
     }
   }
 };
 
 const getPendingBatch = async (limit = 5) => {
-  const items = await ScrapeQueue.find({
-    status: 'pending',
-    retries: { $lt: 3 }
-  })
+  try {
+    const items = await ScrapeQueue.find({
+      status: 'pending',
+      retries: { $lt: 3 }
+    })
     .sort({ addedAt: 1 })
     .limit(limit);
-  
-  if (items.length > 0) {
-    const ids = items.map(item => item._id);
-    await ScrapeQueue.updateMany(
-      { _id: { $in: ids } },
-      { $set: { status: 'processing' } }
-    );
+    
+    if (items.length > 0) {
+      const ids = items.map(item => item._id);
+      await ScrapeQueue.updateMany(
+        { _id: { $in: ids } },
+        { $set: { status: 'processing' } }
+      );
+    }
+    
+    return items;
+  } catch (error) {
+    console.error('❌ Get batch error:', error.message);
+    return [];
   }
-  
-  return items;
 };
 
 const markScrapeDone = async (queueId) => {
-  await ScrapeQueue.deleteOne({ _id: queueId });
+  try {
+    await ScrapeQueue.deleteOne({ _id: queueId });
+  } catch (error) {
+    console.error('❌ Mark done error:', error.message);
+  }
 };
 
-const markScrapeFailed = async (queueId, error) => {
-  await ScrapeQueue.updateOne(
-    { _id: queueId },
-    {
-      $set: { status: 'pending', error },
-      $inc: { retries: 1 }
-    }
-  );
+const markScrapeFailed = async (queueId, errorMsg) => {
+  try {
+    await ScrapeQueue.updateOne(
+      { _id: queueId },
+      {
+        $set: { 
+          status: 'pending',
+          error: errorMsg 
+        },
+        $inc: { retries: 1 }
+      }
+    );
+  } catch (error) {
+    console.error('❌ Mark failed error:', error.message);
+  }
 };
 
 const cleanupOldQueue = async () => {
-  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  await ScrapeQueue.deleteMany({ addedAt: { $lt: cutoff } });
+  try {
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const result = await ScrapeQueue.deleteMany({ 
+      addedAt: { $lt: cutoff },
+      retries: { $gte: 3 }
+    });
+    
+    if (result.deletedCount > 0) {
+      console.log(`🧹 Cleaned ${result.deletedCount} old queue items`);
+    }
+  } catch (error) {
+    console.error('❌ Cleanup error:', error.message);
+  }
 };
 
 // ============ STATS ============
 
 const getGlobalStats = async () => {
-  const totalVideos = await getTotalVideos();
-  const totalUsers = await getTotalUsers();
-  
-  const viewsResult = await Video.aggregate([
-    { $group: { _id: null, totalViews: { $sum: '$views' } } }
-  ]);
-  
-  const totalViews = viewsResult[0]?.totalViews || 0;
-  
-  return { totalVideos, totalUsers, totalViews };
+  try {
+    const totalVideos = await getTotalVideos();
+    const totalUsers = await getTotalUsers();
+    
+    const viewsResult = await Video.aggregate([
+      { $group: { _id: null, totalViews: { $sum: '$views' } } }
+    ]);
+    
+    const totalViews = viewsResult[0]?.totalViews || 0;
+    
+    return { 
+      totalVideos, 
+      totalUsers, 
+      totalViews 
+    };
+  } catch (error) {
+    console.error('❌ Stats error:', error.message);
+    return { 
+      totalVideos: 0, 
+      totalUsers: 0, 
+      totalViews: 0 
+    };
+  }
 };
 
 module.exports = {
