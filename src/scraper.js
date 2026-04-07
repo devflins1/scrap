@@ -1,5 +1,4 @@
 const axios = require('axios');
-const cheerio = require('cheerio');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -12,8 +11,14 @@ if (!fs.existsSync(config.TEMP_DIR)) {
   fs.mkdirSync(config.TEMP_DIR, { recursive: true });
 }
 
-// Queue for concurrent downloads
-const downloadQueue = new PQueue({ concurrency: config.CONCURRENT_DOWNLOADS });
+// Download queue with concurrency control
+const downloadQueue = new PQueue({ 
+  concurrency: config.CONCURRENT_DOWNLOADS 
+});
+
+// ============ HELPER FUNCTIONS ============
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ============ HOMEPAGE SCRAPING ============
 
@@ -33,7 +38,7 @@ const getVideoLinks = async () => {
         timeout: config.TIMEOUT
       });
       
-      // Extract video links using regex (faster than cheerio for this)
+      // Extract video links using regex
       const regex = /href="(https:\/\/1080p\.4free\.asia\/\d{4}\/\d{2}\/[^"]+)"/g;
       let match;
       
@@ -41,9 +46,9 @@ const getVideoLinks = async () => {
         urls.add(match[1]);
       }
       
-      console.log(`📄 Page ${page}: Found ${urls.size} total links so far`);
+      console.log(`📄 Page ${page}: Found ${urls.size} links total`);
       
-      await sleep(1000); // Polite scraping
+      await sleep(2000); // Be polite
     }
   } catch (error) {
     console.error('❌ Homepage scraping error:', error.message);
@@ -67,19 +72,20 @@ const scrapeVideoInfo = async (url) => {
       ? titleMatch[1].split('–')[0].trim().substring(0, 100)
       : 'Unknown Video';
     
-    // Extract video URL
-    let videoMatch = data.match(/source src="(https?:\/\/[^"]+\.mp4[^"]*)"/);
+    // Extract direct video URL
+    let videoMatch = data.match(/source\s+src="(https?:\/\/[^"]+\.mp4[^"]*)"/);
     if (!videoMatch) {
-      videoMatch = data.match(/"file":"(https?:\/\/[^"]+\.mp4)"/);
+      videoMatch = data.match(/"file"\s*:\s*"(https?:\/\/[^"]+\.mp4)"/);
     }
     
     if (!videoMatch) {
+      console.log(`⚠️ No video URL found: ${url}`);
       return null;
     }
     
     const directUrl = videoMatch[1].replace(/\\\//g, '/');
     
-    // Check file size via HEAD request
+    // Check file size
     const headResponse = await axios.head(directUrl, {
       headers: config.HEADERS,
       timeout: 15000
@@ -88,12 +94,17 @@ const scrapeVideoInfo = async (url) => {
     const sizeBytes = parseInt(headResponse.headers['content-length'] || 0);
     const sizeMb = sizeBytes / (1024 * 1024);
     
-    if (sizeMb > config.MAX_SIZE_MB || sizeMb < 1) {
-      console.log(`⚠️ Skipped (size ${sizeMb.toFixed(1)}MB): ${title}`);
+    if (sizeMb > config.MAX_SIZE_MB) {
+      console.log(`⚠️ Too large (${sizeMb.toFixed(1)}MB): ${title}`);
       return null;
     }
     
-    // Extract thumbnail (optional)
+    if (sizeMb < 1) {
+      console.log(`⚠️ Too small (${sizeMb.toFixed(1)}MB): ${title}`);
+      return null;
+    }
+    
+    // Extract thumbnail
     const thumbMatch = data.match(/poster="([^"]+)"/);
     const thumbnail = thumbMatch ? thumbMatch[1] : null;
     
@@ -109,7 +120,7 @@ const scrapeVideoInfo = async (url) => {
     if (error.code === 'ECONNABORTED') {
       console.log(`⏱️ Timeout: ${url}`);
     } else {
-      console.error(`❌ Scrape error: ${error.message}`);
+      console.error(`❌ Scrape error for ${url}:`, error.message);
     }
     return null;
   }
@@ -120,49 +131,80 @@ const scrapeVideoInfo = async (url) => {
 const downloadVideo = async (directUrl, filepath) => {
   const writer = fs.createWriteStream(filepath);
   
-  const response = await axios({
-    url: directUrl,
-    method: 'GET',
-    headers: config.HEADERS,
-    responseType: 'stream',
-    timeout: 300000 // 5 minutes
-  });
-  
-  response.data.pipe(writer);
-  
-  return new Promise((resolve, reject) => {
-    writer.on('finish', resolve);
-    writer.on('error', reject);
-  });
+  try {
+    const response = await axios({
+      url: directUrl,
+      method: 'GET',
+      headers: config.HEADERS,
+      responseType: 'stream',
+      timeout: 300000, // 5 minutes
+      maxRedirects: 5
+    });
+    
+    response.data.pipe(writer);
+    
+    return new Promise((resolve, reject) => {
+      writer.on('finish', () => resolve(true));
+      writer.on('error', reject);
+      
+      // Timeout safety
+      setTimeout(() => {
+        reject(new Error('Download timeout'));
+      }, 300000);
+    });
+  } catch (error) {
+    writer.destroy();
+    throw error;
+  }
 };
 
 const uploadToTelegram = async (bot, filepath, videoInfo) => {
   const caption = `🎬 ${videoInfo.title}\n📦 ${videoInfo.sizeMb.toFixed(1)} MB\n\n${config.CHANNEL_USERNAME}`;
   
-  const message = await bot.telegram.sendVideo(
-    config.CHANNEL_ID,
-    { source: filepath },
-    {
-      caption,
-      supports_streaming: true,
-      connect_timeout: 120000,
-      timeout: 120000
-    }
-  );
-  
-  return message.video;
+  try {
+    const message = await bot.telegram.sendVideo(
+      config.CHANNEL_ID,
+      { source: filepath },
+      {
+        caption,
+        supports_streaming: true,
+        connect_timeout: 120000,
+        timeout: 120000
+      }
+    );
+    
+    return message.video;
+  } catch (error) {
+    console.error('❌ Telegram upload error:', error.message);
+    throw error;
+  }
 };
 
 const processVideo = async (bot, videoInfo) => {
-  const fileHash = crypto.createHash('md5').update(videoInfo.url).digest('hex').substring(0, 10);
+  const fileHash = crypto
+    .createHash('md5')
+    .update(videoInfo.url)
+    .digest('hex')
+    .substring(0, 10);
+  
   const filepath = path.join(config.TEMP_DIR, `${fileHash}.mp4`);
   
   try {
-    console.log(`⬇️ Downloading: ${videoInfo.title.substring(0, 40)}`);
+    console.log(`⬇️ Downloading: ${videoInfo.title.substring(0, 40)}...`);
     
     await downloadVideo(videoInfo.directUrl, filepath);
     
-    console.log(`📤 Uploading: ${videoInfo.title.substring(0, 40)}`);
+    // Verify file exists and has size
+    if (!fs.existsSync(filepath)) {
+      throw new Error('Downloaded file not found');
+    }
+    
+    const fileSize = fs.statSync(filepath).size;
+    if (fileSize < 1024) {
+      throw new Error('Downloaded file too small');
+    }
+    
+    console.log(`📤 Uploading: ${videoInfo.title.substring(0, 40)}...`);
     
     const video = await uploadToTelegram(bot, filepath, videoInfo);
     
@@ -177,7 +219,7 @@ const processVideo = async (bot, videoInfo) => {
       channelPosted: true
     });
     
-    console.log(`✅ Done: ${videoInfo.title.substring(0, 40)}`);
+    console.log(`✅ Success: ${videoInfo.title.substring(0, 40)}`);
     
     return true;
     
@@ -200,6 +242,8 @@ const processVideo = async (bot, videoInfo) => {
 // ============ BATCH PROCESSING ============
 
 const processBatch = async (bot, queueItems) => {
+  const tasks = [];
+  
   for (const item of queueItems) {
     try {
       // Check if already exists
@@ -213,12 +257,12 @@ const processBatch = async (bot, queueItems) => {
       const videoInfo = await scrapeVideoInfo(item.url);
       
       if (!videoInfo) {
-        await db.markScrapeFailed(item._id, 'Failed to scrape video info');
+        await db.markScrapeFailed(item._id, 'Failed to scrape');
         continue;
       }
       
-      // Add to download queue (respects concurrency limit)
-      await downloadQueue.add(async () => {
+      // Add to download queue (respects concurrency)
+      const task = downloadQueue.add(async () => {
         const success = await processVideo(bot, videoInfo);
         
         if (success) {
@@ -228,13 +272,16 @@ const processBatch = async (bot, queueItems) => {
         }
       });
       
+      tasks.push(task);
+      
     } catch (error) {
-      console.error(`Batch item error: ${error.message}`);
+      console.error('Batch item error:', error.message);
       await db.markScrapeFailed(item._id, error.message);
     }
   }
   
-  // Wait for all downloads to complete
+  // Wait for all to complete
+  await Promise.all(tasks);
   await downloadQueue.onIdle();
 };
 
@@ -244,15 +291,14 @@ const scraperCycle = async (bot) => {
   try {
     console.log('🔄 Starting scraper cycle...');
     
-    // Get video links from homepage
     const videoUrls = await getVideoLinks();
     console.log(`📊 Found ${videoUrls.length} video URLs`);
     
     if (videoUrls.length === 0) {
+      console.log('⚠️ No videos found');
       return;
     }
     
-    // Add to queue
     await db.addToScrapeQueue(videoUrls);
     
     // Process queue in batches
@@ -266,13 +312,13 @@ const scraperCycle = async (bot) => {
       console.log(`📦 Processing batch of ${batch.length} videos`);
       await processBatch(bot, batch);
       
-      await sleep(2000);
+      await sleep(3000);
     }
     
     console.log('✅ Scraper cycle completed');
     
   } catch (error) {
-    console.error('❌ Scraper cycle error:', error);
+    console.error('❌ Scraper cycle error:', error.message);
   }
 };
 
@@ -284,19 +330,17 @@ const startAutoScraper = (bot) => {
   const runCycle = async () => {
     try {
       await scraperCycle(bot);
-      
-      // Cleanup old queue
       await db.cleanupOldQueue();
-      
     } catch (error) {
-      console.error('Loop error (auto-restarting):', error);
+      console.error('Loop error (will retry):', error.message);
     }
     
     // Schedule next cycle
-    setTimeout(runCycle, config.SCRAPE_INTERVAL_MIN * 60 * 1000);
+    const interval = config.SCRAPE_INTERVAL_MIN * 60 * 1000;
+    setTimeout(runCycle, interval);
   };
   
-  // Start first cycle after 10 seconds
+  // Start after 10 seconds
   setTimeout(runCycle, 10000);
 };
 
@@ -307,12 +351,20 @@ const startCleanupLoop = () => {
     try {
       if (fs.existsSync(config.TEMP_DIR)) {
         const files = fs.readdirSync(config.TEMP_DIR);
-        files.forEach(file => {
+        
+        for (const file of files) {
           const filepath = path.join(config.TEMP_DIR, file);
-          fs.unlinkSync(filepath);
-        });
+          const stats = fs.statSync(filepath);
+          
+          // Delete files older than 1 hour
+          const age = Date.now() - stats.mtimeMs;
+          if (age > 60 * 60 * 1000) {
+            fs.unlinkSync(filepath);
+          }
+        }
+        
         if (files.length > 0) {
-          console.log(`🧹 Cleaned ${files.length} temp files`);
+          console.log(`🧹 Cleanup check: ${files.length} temp files`);
         }
       }
     } catch (error) {
@@ -320,10 +372,6 @@ const startCleanupLoop = () => {
     }
   }, 60 * 60 * 1000); // Every hour
 };
-
-// ============ HELPER ============
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 module.exports = {
   startAutoScraper,
