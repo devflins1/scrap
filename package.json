@@ -1,11 +1,14 @@
 {
   "name": "video-scraper-bot",
   "version": "1.0.0",
-  "description": "Auto video scraper Telegram bot",
+  "description": "Auto video scraper Telegram bot for 1080p.4free.asia",
   "main": "src/bot.js",
   "scripts": {
     "start": "node src/bot.js"
   },
+  "keywords": ["telegram", "bot", "scraper", "video"],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
     "telegraf": "^4.16.3",
     "mongoose": "^8.2.0",
