@@ -1,10 +1,10 @@
 {
   "name": "video-scraper-bot",
   "version": "1.0.0",
+  "description": "Auto video scraper Telegram bot",
   "main": "src/bot.js",
   "scripts": {
-    "start": "node src/bot.js",
-    "dev": "nodemon src/bot.js"
+    "start": "node src/bot.js"
   },
   "dependencies": {
     "telegraf": "^4.16.3",
@@ -12,12 +12,7 @@
     "axios": "^1.6.7",
     "cheerio": "^1.0.0-rc.12",
     "dotenv": "^16.4.5",
-    "p-queue": "^8.0.1",
-    "node-cron": "^3.0.3",
-    "form-data": "^4.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.0"
+    "p-queue": "^8.0.1"
   },
   "engines": {
     "node": ">=18.0.0"
